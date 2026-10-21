@@ -15,8 +15,9 @@
 %      显著畸变的网格和散点数据会报错，不会被自动重采样。
 %   2. EBSD 测得晶格取向，不直接测得独立的弹性旋转场；以下结果
 %      是按照论文中取向场处理方式得到的模型估计值。
-%   3. 此版本直接使用文件中保存的取向代表元，未做晶体对称等价
-%      取向的空间连续性优化。代表元突然跳变可产生伪影，需要检查图像。
+%   3. 在矩阵对数和差分前检查索引质量，并在各晶粒的四邻接连通域内
+%      仅选择晶体对称等价代表元；不平均取向、不合并母晶/孪晶。
+%      无法连续提升的回路边及主值对数分支切口会被标记并禁止差分。
 %   4. 晶粒内部优先用中心差分；晶界使用指向同一晶粒内部的单侧差分。
 %   5. 脚本采用的李代数修正公式：
 %       kappa_x = d_x(omega) + 1/2 omega x d_x(omega)
@@ -32,7 +33,10 @@
 % -------------------------------------------------------------------------
 
 % 清理工作区变量、关闭现有图窗，并清空命令窗口。
-clearvars; close all; clc;
+clearvars; clc;
+% 将本脚本旁的数值辅助函数加入当前会话，不修改持久 MATLAB 路径。
+scriptDir = fileparts(mfilename('fullpath'));
+addpath(scriptDir);
 
 %% 用户设置
 % 可以填写 MTEX 支持的 EBSD 文件路径，例如 .ctf、.ang、.osc 或 .h5。
@@ -53,6 +57,23 @@ h5oinaDataSet = 'EBSD';
 % 相邻测点的取向差达到此角度时，晶粒重建可能将它们分在不同晶粒。
 % 用 3° 的相邻取向差作为重建晶粒的晶界阈值。
 grainBoundaryAngleDeg = 3;
+
+% 索引质量阈值示例：MAD 单位通常为度，CI 无量纲，须按仪器导出定义核实。
+% 字段匹配不区分大小写；不存在的字段会警告，不会伪装成质量已合格。
+% 不给 BC/IQ 设置通用阈值，因其强烈依赖仪器、相和采集条件。
+qualityRules = struct('field',{'mad','ci'},'minimum',{[],0.1},'maximum',{1.0,[]});
+% 同晶粒的相邻点若约化取向差过大，也不传播或跨边差分，默认不超过重建阈值。
+maxContinuityAngleDeg = 3;
+% 孤立异常：至少三个同晶粒邻点的约化角中位数超过 2 度时标记为可疑。
+% 默认仅标记；不能仅凭此判据区分错误索引和真实局部取向梯度。
+localOutlierAngleDeg = 2;
+minLocalNeighbors = 3;
+excludeLocalOutliers = false;
+% 如已有独立识别的晶界/孪晶界，可给出保护边掩膜 MAT 文件（不合并孪晶）。
+% 文件包含 blockedX(ny,nx-1)、blockedY(ny-1,nx)、xPlot、yPlot，坐标需与本图一致。
+protectedBoundaryFile = '';
+% 主值旋转向量跨边差大于该值（弧度）时，标记对数切口而非强行展开。
+maxLogVectorJumpRad = pi;
 
 % 脚本默认不删除小晶粒，以免改变原始的小尺度结构。
 
@@ -139,6 +160,14 @@ if ~isempty(phaseName)
     end
 % 结束是否选择物相的判断。
 end
+% 在晶粒重建之前验证坐标，避免用非有限位置建立邻接关系。
+if any(~isfinite(ebsd.x(:))) || any(~isfinite(ebsd.y(:)))
+    error('EBSD coordinates contain NaN or Inf; inspect the imported scan.');
+end
+assert(isscalar(grainBoundaryAngleDeg) && isfinite(grainBoundaryAngleDeg) ...
+    && grainBoundaryAngleDeg>0 && grainBoundaryAngleDeg<180, 'Invalid grain threshold.');
+assert(isscalar(maxContinuityAngleDeg) && isfinite(maxContinuityAngleDeg) ...
+    && maxContinuityAngleDeg>0 && maxContinuityAngleDeg<180, 'Invalid continuity threshold.');
 % 检查筛选后是否仍有足够的测点。
 if numel(ebsd) < 9
     % 少于九个测点时停止二维导数计算。
@@ -151,8 +180,8 @@ end
 fprintf('Reconstructing grains (threshold %.2f deg)...\n',grainBoundaryAngleDeg);
 % 尝试根据所选物相的取向重建晶粒。
 try
-    % calcGrains 返回晶粒集合 grains，以及带 grainId 的 EBSD 测点。
-    [grains, ebsd] = calcGrains(ebsd,'angle',grainBoundaryAngleDeg*degree);
+    % MTEX 7.2 返回晶粒集合 grains，以及带 grainId 的 EBSD 测点。
+    [grains, ebsd] = calcGrains(ebsd,'angle',grainBoundaryAngleDeg*degree,'minPixel',1);
 % 捕获晶粒重建失败的异常。
 catch ME
     % 说明可能是晶体对称性或 MTEX 设置问题。
@@ -288,93 +317,77 @@ end
 % 打印网格行列数以及由坐标估计得到的 dx、dy。
 fprintf('Grid: %d columns x %d rows; dx = %.6g, dy = %.6g (input length unit).\n',nx,ny,dx,dy);
 
-%% 将旋转矩阵经主值对数映射为旋转向量 omega
-% MTEX 的 matrix(orientation) 预期返回 3×3×N 的数组。
-% 尝试把 MTEX 取向对象转换成旋转矩阵数组。
-try
-    % 预期得到维度为 3×3×N 的取向矩阵。
-    Rall = matrix(ebsd.orientations);
-% 捕获取向矩阵转换失败的异常。
-catch ME
-    % 连同 MTEX 错误一起报告，方便定位物相或取向问题。
-    error('Could not extract orientation matrices using matrix(ebsd.orientations): %s',ME.message);
-% 结束矩阵转换异常处理。
+%% 索引质量检查与晶粒内对称等价取向连续化（先于对数和差分）
+[qualityGood,seedScore,qualityReport] = checkIndexQuality(ebsd.prop,N,qualityRules);
+Rall = double(matrix(ebsd.orientations));
+if size(Rall,1)~=3 || size(Rall,2)~=3 || size(Rall,3)~=N
+    error('Unexpected orientation matrix dimensions; expected 3x3xN.');
 end
-% 逐一核查矩阵数组的三维长度。
-if size(Rall,1) ~= 3 || size(Rall,2) ~= 3 || size(Rall,3) ~= N
-    % 不是 3×3×N 时停止，以免错误地给测点分配取向。
-    error('Unexpected MTEX matrix(orientations) dimensions. Expected 3x3xN.');
-% 结束矩阵维度核查。
-end
-
-% 为每个网格像素预分配三个旋转向量分量，默认 NaN 表示无值。
-omegaGrid = nan(ny,nx,3);
-% 预分配晶粒编号图；零表示没有可用晶粒。
-grainGrid = zeros(ny,nx);
-% 预分配有效点掩膜，初始全部为 false。
-validGrid = false(ny,nx);
-% 逐点把 MTEX 测量列表映射到二维网格。
-for p = 1:N
-    % 跳过没有有限正数晶粒编号的测点。
-    if ~isfinite(grainId(p)) || grainId(p) <= 0
-        % 继续处理下一个测点。
-        continue;
-    % 结束无效晶粒编号判断。
+% 只使用晶体正旋转群。禁止加入试样对称操作或把孪晶当作对称操作。
+ori = ebsd.orientations;
+properCS = ori.CS.properGroup;
+symOps = double(matrix(properCS.rot));
+options.maxEdgeAngle = min(maxContinuityAngleDeg,grainBoundaryAngleDeg)*degree;
+options.localOutlierAngle = localOutlierAngleDeg*degree;
+options.minLocalNeighbors = minLocalNeighbors;
+options.excludeLocalOutliers = excludeLocalOutliers;
+options.blockedX = false(ny,nx-1); options.blockedY = false(ny-1,nx);
+xPlot = x0+(0:nx-1)*dx; yPlot = y0+(0:ny-1)*dy;
+if ~isempty(protectedBoundaryFile)
+    boundary = load(protectedBoundaryFile,'blockedX','blockedY','xPlot','yPlot');
+    required = {'blockedX','blockedY','xPlot','yPlot'};
+    if ~all(isfield(boundary,required))
+        error('Protected-boundary file must contain blockedX, blockedY, xPlot and yPlot.');
     end
-    % 取出第 p 个测点的 3×3 旋转矩阵。
-    Rp = double(Rall(:,:,p));
-    % 检测矩阵是否含 NaN 或 Inf。
-    if any(~isfinite(Rp(:)))
-        % 矩阵不完整时跳过此点。
-        continue;
-    % 结束矩阵有效性判断。
+    if numel(boundary.xPlot)~=nx || numel(boundary.yPlot)~=ny ...
+            || any(abs(boundary.xPlot(:)-xPlot(:))>coordTol*20) ...
+            || any(abs(boundary.yPlot(:)-yPlot(:))>coordTol*20) ...
+            || any(~isfinite([boundary.xPlot(:);boundary.yPlot(:)]))
+        error('Protected-boundary coordinates do not match this EBSD grid.');
     end
-    % 将略偏离 SO(3) 的数值矩阵投影回最近的合法旋转矩阵。
-    % 用奇异值分解取得最近的正交矩阵因子。
-    [U,~,V] = svd(Rp);
-    % 构造行列式为 +1 的旋转矩阵，修正数值误差及反射。
-    Rp = U*diag([1 1 det(U*V')])*V';
-    % 求旋转矩阵的主值对数，并以三分量旋转向量 w 表示。
-    w = localRotmLog(Rp);
-    % 将三个旋转分量写入对应的网格行列。
-    omegaGrid(iy(p),ix(p),:) = reshape(w,1,1,3);
-    % 将这个像素所属的晶粒编号写入晶粒图。
-    grainGrid(iy(p),ix(p)) = grainId(p);
-    % 标记该网格位置为有效测点。
-    validGrid(iy(p),ix(p)) = true;
-% 结束逐测点循环。
+    if ~all(ismember(boundary.blockedX(:),[0,1])) ...
+            || ~all(ismember(boundary.blockedY(:),[0,1]))
+        error('Protected-boundary masks must contain only 0 or 1.');
+    end
+    options.blockedX = logical(boundary.blockedX);
+    options.blockedY = logical(boundary.blockedY);
+end
+field = prepareSymmetryContinuousField(Rall,grainId,linIdx,[ny,nx], ...
+    symOps,qualityGood,seedScore,options);
+grainGrid = field.grainGrid; validGrid = field.validGrid;
+if nnz(validGrid)<9
+    error('Fewer than 9 usable points remain after quality/rotation checks.');
+end
+% 保留原始代表元和修正代表元；两者用完全相同的质量掩膜与导数边。
+omegaRaw = nan(ny,nx,3); omegaGrid = nan(ny,nx,3);
+for p = find(field.validPoint)'
+    omegaRaw(iy(p),ix(p),:) = reshape(localRotmLog(field.Rraw(:,:,p)),1,1,3);
+    omegaGrid(iy(p),ix(p),:) = reshape(localRotmLog(field.Rcontinuous(:,:,p)),1,1,3);
+end
+% SO(3) 的连续代表元仍可能跨主值 log 的 pi 切口，不能靠平滑掩盖。
+assert(isscalar(maxLogVectorJumpRad) && isfinite(maxLogVectorJumpRad) ...
+    && maxLogVectorJumpRad>0 && maxLogVectorJumpRad<=pi, 'Invalid log-cut threshold.');
+logJumpX = sqrt(sum(diff(omegaGrid,1,2).^2,3));
+logJumpY = sqrt(sum(diff(omegaGrid,1,1).^2,3));
+logCutX = field.edgeX & logJumpX>maxLogVectorJumpRad;
+logCutY = field.edgeY & logJumpY>maxLogVectorJumpRad;
+edgeX = field.edgeX & ~logCutX; edgeY = field.edgeY & ~logCutY;
+qualityRejectedGrid = false(ny,nx); qualityRejectedGrid(linIdx)=~qualityGood;
+suspectGrid = false(ny,nx); suspectGrid(linIdx)=field.suspectLocal;
+fprintf('Quality rejected: %d; invalid SO(3): %d; local suspects: %d (excluded=%d).\n', ...
+    nnz(~qualityGood),nnz(field.invalidRotation),nnz(field.suspectLocal),excludeLocalOutliers);
+fprintf('Independent domains: %d; loop-conflict edges: %d; log-cut edges: %d.\n', ...
+    max(field.componentGrid(:)),nnz(field.loopConflictX)+nnz(field.loopConflictY), ...
+    nnz(logCutX)+nnz(logCutY));
+if any(field.loopConflictX(:)) || any(field.loopConflictY(:)) ...
+        || any(logCutX(:)) || any(logCutY(:))
+    warning('Some edges remain discontinuous; both derivative stages exclude them. Inspect diagnostics.');
 end
 
-% 检查有效网格测点是否仍至少有九个。
-if nnz(validGrid) < 9
-    % 有效点太少时停止向错密度计算。
-    error('Fewer than 9 valid grid locations could be mapped.');
-% 结束有效点检查。
-end
-
-%% 计算李代数修正的一阶导数与晶格曲率
-% 两侧同晶粒邻点均可用时用中心差分；晶界处用指向晶粒内部的单侧差分。
-% 对旋转向量场沿 x 列方向求同晶粒内的差分，步长为 dx。
-dOmegaX = maskedDerivative(omegaGrid,grainGrid,validGrid,2,dx); % d/dx (columns)
-% 对旋转向量场沿 y 行方向求同晶粒内的差分，步长为 dy。
-dOmegaY = maskedDerivative(omegaGrid,grainGrid,validGrid,1,dy); % d/dy (rows)
-
-% 三维旋转向量形式下，李括号 [a,b] 对应向量叉乘 a×b。
-% 计算 x 向李代数修正曲率：旋转向量梯度加半个叉乘项。
-kappaX = dOmegaX + 0.5*crossField(omegaGrid,dOmegaX);
-% 以同样公式计算 y 向李代数修正曲率。
-kappaY = dOmegaY + 0.5*crossField(omegaGrid,dOmegaY);
-
-%% 计算曲率的李修正旋度，即二维可得的 theta(:,3)
-% 按脚本采用的张量旋度约定：theta_i3 = D~_x(kappa_i,y) - D~_y(kappa_i,x)。
-% 沿 x 方向对 y 向曲率求受晶粒掩膜约束的导数。
-dKappaY_dx = maskedDerivative(kappaY,grainGrid,validGrid,2,dx);
-% 沿 y 方向对 x 向曲率求受晶粒掩膜约束的导数。
-dKappaX_dy = maskedDerivative(kappaX,grainGrid,validGrid,1,dy);
-% 两个曲率导数相减，构成普通二维旋度。
-ordinaryCurl = dKappaY_dx - dKappaX_dy;
-% 再加上旋转向量与旋度的半个叉乘，得到脚本采用的李修正向错密度列。
-theta = ordinaryCurl + 0.5*crossField(omegaGrid,ordinaryCurl);
+%% 用同一公式、同一质量掩膜和同一边掩膜计算处理前后结果
+% 仅移除对称代表元跳变；不把晶界/孪晶界两侧取向拉到一起。
+[thetaRaw,~,~] = densityFromOmega(omegaRaw,grainGrid,validGrid,edgeX,edgeY,dx,dy);
+[theta,kappaX,kappaY] = densityFromOmega(omegaGrid,grainGrid,validGrid,edgeX,edgeY,dx,dy);
 
 % 三个分量的单位均为 rad/(输入长度单位)^2。
 % 取向错密度张量第三列的第 1 个分量 theta13。
@@ -422,15 +435,45 @@ figFile = fullfile(outDir,[baseName '_LieDisclinationDensity.png']);
 % 按网格原点及步长生成每个像素的二维 x、y 坐标。
 [Xgrid,Ygrid] = meshgrid(min(x)+(0:nx-1)*dx, min(y)+(0:ny-1)*dy);
 % 建立结果表；以下三行依次放入坐标、晶粒号、掩膜、三个分量及范数，并命名表列。
-T = table(Xgrid(:),Ygrid(:),grainGrid(:),validGrid(:), ...
-    theta13(:),theta23(:),theta33(:),rhoTheta(:), ...
-    'VariableNames',{'x','y','grainId','indexed','theta13','theta23','theta33','rhoTheta'});
+indexedGrid = false(ny,nx); indexedGrid(linIdx)=true;
+invalidRotationGrid = false(ny,nx); invalidRotationGrid(linIdx)=field.invalidRotation;
+raw13=thetaRaw(:,:,1); raw23=thetaRaw(:,:,2); raw33=thetaRaw(:,:,3);
+T = table(Xgrid(:),Ygrid(:),grainGrid(:),indexedGrid(:), ...
+    theta13(:),theta23(:),theta33(:),rhoTheta(:),validGrid(:), ...
+    qualityRejectedGrid(:),invalidRotationGrid(:),suspectGrid(:), ...
+    raw13(:),raw23(:),raw33(:), ...
+    'VariableNames',{'x','y','grainId','indexed','theta13','theta23','theta33','rhoTheta', ...
+    'usable','qualityRejected','invalidRotation','localSuspect','rawTheta13','rawTheta23','rawTheta33'});
 % 把结果表写入 CSV 文件。
 writetable(T,csvFile);
 % 把主要结果和中间变量写入 MAT 文件；这条 save 语句跨三行。
 save(matFile,'theta13','theta23','theta33','rhoTheta','omegaGrid', ...
     'kappaX','kappaY','grainGrid','validGrid','validResult','dx','dy', ...
-    'grainBoundaryAngleDeg','inputFile','xVals','yVals');
+    'grainBoundaryAngleDeg','inputFile','xVals','yVals','omegaRaw','thetaRaw', ...
+    'field','qualityRules','qualityReport','qualityGood','qualityRejectedGrid','suspectGrid', ...
+    'edgeX','edgeY','logCutX','logCutY','options','maxLogVectorJumpRad', ...
+    'protectedBoundaryFile','symOps','indexedGrid','invalidRotationGrid');
+
+%% 保存处理前后分量比较及质量诊断（同分量共用色标）
+compareFile = fullfile(outDir,[baseName '_LieComponents_before_after.png']);
+compareComponents(thetaRaw,theta,grainGrid,xPlot,yPlot,dx,dy, ...
+    {'\theta_{13}','\theta_{23}','\theta_{33}'},compareFile);
+compareComponents(omegaRaw,omegaGrid,grainGrid,xPlot,yPlot,dx,dy, ...
+    {'\omega_1 (rad)','\omega_2 (rad)','\omega_3 (rad)'}, ...
+    fullfile(outDir,[baseName '_RotationVector_before_after.png']));
+% 诊断图保留晶界；红/黄点仅为质量/局部异常标记，不是孪晶判据。
+figQuality = figure('Color','w','Name','质量及连续性诊断');
+tiledlayout(1,2,'Padding','compact','TileSpacing','compact');
+nexttile; imagesc(xPlot,yPlot,double(validGrid)); axis image; set(gca,'YDir','normal');
+hold on; plotRasterBoundaries(grainGrid,xPlot,yPlot,dx,dy);
+scatter(x(~qualityGood),y(~qualityGood),12,'r','filled');
+scatter(x(field.suspectLocal),y(field.suspectLocal),18,'y'); hold off;
+title('可用点；红：质量剔除，黄：局部可疑'); xlabel('x'); ylabel('y'); colorbar;
+nexttile; imagesc(xPlot,yPlot,field.componentGrid); axis image; set(gca,'YDir','normal');
+hold on; plotRasterBoundaries(grainGrid,xPlot,yPlot,dx,dy);
+plotBlockedEdges(grainGrid,edgeX,edgeY,xPlot,yPlot,dx,dy); hold off;
+title('独立连续域；红线：额外禁用差分边'); xlabel('x'); ylabel('y'); colorbar;
+saveas(figQuality,fullfile(outDir,[baseName '_Quality_continuity.png']));
 
 %% 绘制并保存向错密度图与取向诊断图
 % 创建白底的主结果图窗。
@@ -517,6 +560,7 @@ end
 % 在命令窗口输出 CSV、MAT 与主图的保存路径。
 fprintf('\nDone. Outputs saved to:\n  %s\n  %s\n  %s\n',csvFile,matFile,figFile);
 % 提醒检查对称性取向代表元跳变和晶界伪影；提示文字跨两行。
+fprintf('Before/after comparison: %s\n',compareFile);
 fprintf(['Check the plots for symmetry-representation jumps and boundary artifacts. ' ...
     'Do not interpret the scalar norm alone as the Frank-vector direction.\n']);
 
@@ -600,7 +644,7 @@ function w = localRotmLog(R)
 end
 
 % 定义同晶粒差分函数：输入三分量场 F、晶粒号 G、有效点掩膜、方向 dim 和步长 h。
-function D = maskedDerivative(F,G,valid,dim,h)
+function D = maskedDerivative(F,G,valid,dim,h,edgeX,edgeY)
 % 对 ny×nx×3 的 F 求一阶导数，邻点必须属于同一晶粒。
 % dim=2 对列求导（x 方向）；dim=1 对行求导（y 方向）。
     % 将输出导数初始化为 NaN，表示尚不能计算。
@@ -612,13 +656,13 @@ function D = maskedDerivative(F,G,valid,dim,h)
         % 遍历该行的每一列像素。
         for j = 1:nx
             % 无效像素或无晶粒号像素直接跳过。
-            if ~valid(i,j) || G(i,j)<=0, continue; end
+            if ~valid(i,j) || G(i,j)<=0 || ~all(isfinite(reshape(F(i,j,:),1,[]))), continue; end
             % 当 dim=2 时，沿列方向即 x 方向计算差分。
             if dim == 2
                 % 检查左邻点是否存在、有效、属于同一晶粒且三个场分量都有限。
-                hasM = j>1  && valid(i,j-1) && G(i,j-1)==G(i,j) && all(isfinite(reshape(F(i,j-1,:),1,[])));
+                hasM = j>1  && edgeX(i,j-1) && valid(i,j-1) && G(i,j-1)==G(i,j) && all(isfinite(reshape(F(i,j-1,:),1,[])));
                 % 以同样条件检查右邻点。
-                hasP = j<nx && valid(i,j+1) && G(i,j+1)==G(i,j) && all(isfinite(reshape(F(i,j+1,:),1,[])));
+                hasP = j<nx && edgeX(i,j) && valid(i,j+1) && G(i,j+1)==G(i,j) && all(isfinite(reshape(F(i,j+1,:),1,[])));
                 % 左右同晶粒邻点都可用时采用中心差分。
                 if hasM && hasP
                     % 用左右邻点之差除以 2h。
@@ -636,9 +680,9 @@ function D = maskedDerivative(F,G,valid,dim,h)
             % 当 dim=1 时，沿行方向即 y 方向计算差分。
             elseif dim == 1
                 % 检查上邻点是否存在、有效、同晶粒且场分量有限。
-                hasM = i>1  && valid(i-1,j) && G(i-1,j)==G(i,j) && all(isfinite(reshape(F(i-1,j,:),1,[])));
+                hasM = i>1  && edgeY(i-1,j) && valid(i-1,j) && G(i-1,j)==G(i,j) && all(isfinite(reshape(F(i-1,j,:),1,[])));
                 % 以同样条件检查下邻点。
-                hasP = i<ny && valid(i+1,j) && G(i+1,j)==G(i,j) && all(isfinite(reshape(F(i+1,j,:),1,[])));
+                hasP = i<ny && edgeY(i,j) && valid(i+1,j) && G(i+1,j)==G(i,j) && all(isfinite(reshape(F(i+1,j,:),1,[])));
                 % 上下同晶粒邻点均可用时采用中心差分。
                 if hasM && hasP
                     % 用下邻点与上邻点之差除以 2h。
@@ -718,4 +762,101 @@ function C = crossField(A,B)
     % 按向量叉乘公式计算第三分量 ax*by-ay*bx。
     C(:,:,3) = ax.*by-ay.*bx;
 % 结束逐像素叉乘函数。
+end
+
+
+function [good,score,report] = checkIndexQuality(prop,n,rules)
+% 按原字段逐项检查：仅记录字段名与阈值，不猜测缺失指标或插补坏点。
+    good = true(n,1); score = zeros(n,1);
+    names = fieldnames(prop); report = struct('field',{},'available',{},'rejected',{});
+    for k = 1:numel(rules)
+        match = find(strcmpi(names,rules(k).field));
+        report(k).field = rules(k).field;
+        report(k).available = ~isempty(match); report(k).rejected = 0;
+        if isempty(match)
+            warning('Quality field "%s" absent; its threshold was NOT checked.',rules(k).field);
+            continue;
+        end
+        if numel(match)~=1, error('Ambiguous quality field: %s',rules(k).field); end
+        values = prop.(names{match});
+        if ~isnumeric(values) || ~isreal(values) || numel(values)~=n
+            error('Quality field %s must be a real numeric value per point.',names{match});
+        end
+        values = double(values(:)); ok = isfinite(values);
+        low = rules(k).minimum; high = rules(k).maximum;
+        if ~isempty(low)
+            assert(isscalar(low) && isfinite(low),'Invalid quality minimum.');
+            ok = ok & values>=low;
+        end
+        if ~isempty(high)
+            assert(isscalar(high) && isfinite(high),'Invalid quality maximum.');
+            ok = ok & values<=high;
+        end
+        if ~isempty(low) && ~isempty(high), assert(low<=high,'Invalid quality interval.'); end
+        good = good & ok; report(k).rejected = nnz(~ok);
+        fprintf('Quality %s: min=%s max=%s, rejected %d/%d.\n', ...
+            names{match},mat2str(low),mat2str(high),nnz(~ok),n);
+        % 种子排序只在有单向质量定义时使用，分位次序不改变任何取向。
+        if xor(isempty(low),isempty(high))
+            direction = 1;
+            if ~isempty(high), direction = -1; end
+            eligible = find(ok);
+            if ~isempty(eligible)
+                v = direction*values(eligible); [~,~,rank] = unique(v);
+                score(eligible) = score(eligible)+double(rank)/max(rank);
+            end
+        end
+    end
+    if ~any([report.available])
+        warning('No configured quality fields found; quality remains unverified. Inspect indexing diagnostics.');
+    end
+end
+
+function [theta,kappaX,kappaY] = densityFromOmega(w,g,valid,edgeX,edgeY,dx,dy)
+% 原有李代数截断公式保持不变；两个差分阶段都遵守同一保护边。
+    dX = maskedDerivative(w,g,valid,2,dx,edgeX,edgeY);
+    dY = maskedDerivative(w,g,valid,1,dy,edgeX,edgeY);
+    kappaX = dX+0.5*crossField(w,dX); kappaY = dY+0.5*crossField(w,dY);
+    curl = maskedDerivative(kappaY,g,valid,2,dx,edgeX,edgeY) ...
+        -maskedDerivative(kappaX,g,valid,1,dy,edgeX,edgeY);
+    theta = curl+0.5*crossField(w,curl);
+end
+
+function compareComponents(before,after,g,x,y,dx,dy,labels,fileName)
+% 每列同一分量共用对称色限；不裁剪极值或各自归一化来制造改善。
+    fig = figure('Color','w','Name','处理前后分量比较');
+    tiledlayout(2,3,'Padding','compact','TileSpacing','compact');
+    for component = 1:3
+        a = before(:,:,component); b = after(:,:,component);
+        shared = isfinite(a) & isfinite(b);
+        values = [a(shared);b(shared)];
+        limit = max(abs(values));
+        if isempty(limit) || limit==0, limit = 1; end
+        % 比较图只显示共同有限的像素；MAT 中保留两者各自的完整结果。
+        a(~shared)=NaN; b(~shared)=NaN;
+        for stage = 1:2
+            nexttile((stage-1)*3+component);
+            imageData = a; stageName = '原始代表元';
+            if stage==2, imageData=b; stageName='连续等价代表元'; end
+            h = imagesc(x,y,imageData); set(h,'AlphaData',isfinite(imageData));
+            axis image; set(gca,'YDir','normal'); caxis([-limit,limit]); colorbar;
+            hold on; plotRasterBoundaries(g,x,y,dx,dy); hold off;
+            title(sprintf('%s | %s',stageName,labels{component})); xlabel('x'); ylabel('y');
+        end
+    end
+    sgtitle('相同质量/差分掩膜；同分量相同色标');
+    saveas(fig,fileName);
+end
+
+function plotBlockedEdges(g,edgeX,edgeY,x,y,dx,dy)
+% 只标记同晶粒内禁用的边；跨晶粒边仍由黑色晶界线表示。
+    blockedX = ~edgeX & g(:,1:end-1)>0 & g(:,1:end-1)==g(:,2:end);
+    blockedY = ~edgeY & g(1:end-1,:)>0 & g(1:end-1,:)==g(2:end,:);
+    [i,j] = find(blockedX); xm=x(j)+dx/2; ym=y(i);
+    xv=[xm(:),xm(:),nan(numel(i),1)]';
+    yv=[ym(:)-dy/2,ym(:)+dy/2,nan(numel(i),1)]';
+    [i,j] = find(blockedY); xm=x(j); ym=y(i)+dy/2;
+    xh=[xm(:)-dx/2,xm(:)+dx/2,nan(numel(i),1)]';
+    yh=[ym(:),ym(:),nan(numel(i),1)]';
+    line([xv(:);xh(:)],[yv(:);yh(:)],'Color','r','LineWidth',0.5);
 end
