@@ -153,7 +153,9 @@ end
 % 明确列出输入相及未处理相；本脚本按目标相分别运行，不混用对称群。
 inputPhaseIds=unique(ebsd.phaseId);
 for pid=inputPhaseIds(:)'
-    cs=ebsd.CSList{pid};
+    % 从单相 EBSD 子集读取公开的 CS 属性，不直接索引版本相关的 CSList。
+    phaseEbsd=ebsd(ebsd.phaseId==pid);
+    cs=phaseEbsd.CS;
     fprintf('输入晶相 ID=%d, 名称=%s, 点数=%d\n',pid,cs.mineral,nnz(ebsd.phaseId==pid));
 end
 % 若 phaseName 不为空，则进一步筛选目标物相。
