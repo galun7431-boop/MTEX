@@ -1,6 +1,6 @@
 function tests = test_symmetry_continuity
 % 合成矩阵回归测试；不需要 EBSD 文件或 MTEX，但需要 MATLAB。
-% 本次云端仅做静态检查，未执行本文件。
+% 执行状态见 scripts/README.md；此文件需 MATLAB unittest。
     tests = functiontests(localfunctions);
 end
 
@@ -61,13 +61,14 @@ function testTrueAndTwinBoundariesRemainSeparate(testCase)
     verifyGreaterThan(testCase,norm(a-b,'fro'),0.1);
 end
 
-function testLargeJumpBlockedEvenWithWrongGrainLabel(testCase)
-% 即使外部晶粒编号错误地相同，过大物理跳变也不能成为传播/差分边。
+function testLargePhysicalJumpOnlyFlagged(testCase)
     [r,s,g,idx,good,score,o] = fixture;
-    for p=4:9, r(:,:,p)=rx(86*pi/180); end
+    for p=4:9, r(:,:,p)=rx(5*pi/180); end
     f=prepareSymmetryContinuousField(r,g,idx,[3,3],s,good,score,o);
-    verifyFalse(testCase,any(f.edgeX(:,1)));
-    verifyEqual(testCase,max(f.componentGrid(:)),2);
+    verifyTrue(testCase,all(f.edgeX(:)));
+    verifyTrue(testCase,any(f.largePhysicalX(:)));
+    verifyEqual(testCase,max(f.componentGrid(:)),1);
+    verifyLessThan(testCase,f.maxInvarianceError,1e-7);
 end
 
 function testQualityHoleCannotBeUsedAsBridge(testCase)
@@ -103,9 +104,8 @@ function testLocalSuspectIsFlaggedWithoutAutomaticSmoothing(testCase)
     f=prepareSymmetryContinuousField(r,g,idx,[3,3],s,good,score,o);
     verifyTrue(testCase,f.suspectLocal(5));
     verifyTrue(testCase,f.validPoint(5));
-    o.excludeLocalOutliers=true;
-    f=prepareSymmetryContinuousField(r,g,idx,[3,3],s,good,score,o);
-    verifyFalse(testCase,f.validPoint(5));
+    % 代表元模块不允许根据局部角度剔除点。
+    verifyLessThan(testCase,f.maxInvarianceError,1e-7);
 end
 
 function [r,s,g,idx,good,score,o] = fixture

@@ -1,59 +1,96 @@
-# MTEX Scripts
+# MTEX 向错密度脚本
 
-MATLAB scripts for EBSD analysis,
-twinning and disclination density.
+实际计算入口为 `scripts/mtex_disclination_density_Lie_3.m`。
+根目录同名脚本是兼容入口，统一执行该文件。项目中不存在
+`mtex_disclination_density_Lie.m`。参数在实际入口顶部设置。
 
-## 向错密度脚本的晶体对称连续化
+## 代表元选择与真实取向差
 
-运行 `mtex_disclination_density_Lie_3.m` 前，先在 MATLAB 中启动 MTEX 7.2.0，
-并修改脚本顶部的输入路径、相名、晶粒阈值及质量阈值。辅助函数
-`prepareSymmetryContinuousField.m` 必须与脚本放在同一目录。
+仅按选定晶相处理，保留默认 `phaseName='Magnesium'` 和 3° 晶粒重构阈值。
+输入所有已索引相的 ID、名称和数量会打印，未处理相会警告并保存。
+如需 Al2Y3，请把 `phaseName` 改成导入数据中的准确名称后单独运行。
+输出文件带 `_phase<ID>` 后缀，避免分相运行互相覆盖。
+多相不允许直接传入单群代表元模块；其他相在空间模板中是空洞。
 
-处理顺序为：索引相选择与晶粒重建 → 质量检查 → 同晶粒四邻接图 →
-选择 `R*S` 晶体正旋转等价代表元 → 主值矩阵对数 → 受边界掩膜约束的两阶差分。
-连续化不做取向平均、不施加试样对称性、不合并母晶与孪晶。晶界两侧和
-被质量空洞分隔的连通域独立处理，不从远处跳过坏点建立邻接。
+只接受原坐标验证通过的轴对齐矩形网格；六角/畸变/散点报错，不重采样。
+`linIdx` 根据实测 x、y 构造，不能使用导入顺序代替空间邻接。
+同晶粒、同相、质量合格且没有显式保护边的四邻接图，按连通域独立处理：
 
-MAD 上限 1 度、CI 下限 0.1 是可配置的示例，须核实导出字段定义与仪器条件。
-缺失字段会警告并记录为未检查；BC/IQ 没有通用阈值。默认标记但不自动剔除
-局部约化取向差异常点，以免误删真实梯度；启用剔除须检查敏感性。
-拒绝非有限、反射和明显偏离 SO(3) 的矩阵，只修正微小舍入误差。
+1. 高质量种子开始传播，候选始终是该测点 `Rraw*S`。
+2. 固定各连通域种子，通过离散坐标下降最小化所有图边的旋转角平方和。
+3. 保存操作编号、原始/选定矩阵、能量历史、迭代次数与诊断标记。
+4. 在原图上重新计算对称约化错配角，误差超过 `1e-7 rad` 即停止。
 
-晶粒重建默认阈值为 3 度，不执行孪晶合并。阈值本身不是孪晶识别算法，
-若重建漏掉已知晶界/孪晶界，应提供 `protectedBoundaryFile`：MAT 文件包含
-逻辑数组 `blockedX(ny,nx-1)`、`blockedY(ny-1,nx)` 和网格中心坐标 `xPlot`、
-`yPlot`。true 表示禁止跨越该边；脚本会核对尺寸与实际扫描坐标。
-四邻接中超过连续性阈值的边、回路代表元不一致的边和处理后 log 分支切口
-也会禁止传播或差分。无法连续化的区域不应靠平滑强行连接。
-晶界处仅求同侧导数，输出不包含跨晶界跳跃的分布型界面密度。
+不做 SO(3) 投影、取向平均、平滑、插值或局部异常点剔除。
+原始 EBSD 对象的取向不被修改。`maxContinuityAngleDeg=3` 和
+`localOutlierAngleDeg=2` 仅为诊断，不能说明取向有错，也不会据此删边/删点。
+真实局部 5° 甚至更大的晶内旋转不因角度大小自动屏蔽。
+`excludeLocalOutliers` 必须为 false；独立的索引质量模块仍使用原有
+MAD/CI 示例规则，缺失字段会警告，仪器阈值需自行核实。
 
-新增输出（在 EBSD 文件旁）：
+50 次迭代是资源上限，不能证明全局最优。下降容差 `1e-12 rad²` 防止舍入引起
+反复切换；候选能量差不超过 `1e-10 rad²` 作为近简并待检查标记。
+未收敛连通域、近简并点、代表元残余增量大于物理约化角的回路边和原有
+主值 log 切口会限制差分；这些不是“物理错配过大”的判据。
+每个晶粒的规范独立，不计算跨晶界/相界的取向梯度，也不进行孪晶分类。
+晶界错配分析应另外使用 MTEX 的对称约化方法，不用选定矩阵直接相减代替。
 
-- `_LieComponents_before_after.png`：原始/连续代表元的三个 theta 分量。
-- `_RotationVector_before_after.png`：三个旋转向量分量比较。
-- `_Quality_continuity.png`：质量剔除、局部可疑点、连续域及禁用边。
-- MAT 文件额外保存原始/修正场、对称操作编号、质量报告、回路/分支诊断和参数。
+## API 与坐标约定
 
-前后结果使用相同质量点掩膜、相同差分边；同一分量共用色标，只显示双方
-共同有限的像素，不用不同归一化制造“改善”。原有李代数截断公式未更改；
-绝对主值 log 及其截断公式并非对任意代表元选择都不变，图像变化不能单独
-证明模型正确。需用已知场、原论文公式及真实数据进一步验证。
+项目说明标注 MTEX 7.2.0，但此云端实际源码
+`/workspace/dependencies/mtex/VERSION` 为 **mtex-6.1.1**。
+没有 MATLAB/Octave，未启动这些 MTEX 类。已检查的真实源码：
 
-静态检查（不执行 MATLAB）：
+- `geometry/@orientation/mtimes.m`：取向将晶体向量映射到试样向量。
+- `geometry/@quaternion/symmetrise.m`：晶体操作 `q*CS.rot` 在右，试样操作在左。
+- `geometry/@symmetry/properGroup.m`、`geometry/@rotation/matrix.m`：提取晶体正旋转。
+- `EBSDAnalysis/@EBSD/calcGrains.m`：第二返回值为 grainId 数组，修复原脚本
+  `[grains,ebsd]` 为 `[grains,ebsd.grainId]`。
+- `geometry/@orientation/byMatrix.m` 和 `angle.m`：验证程序使用的官方接口。
 
-```bash
-/workspace/tools/matlab-static/bin/mh_lint --ignore-config --input-encoding utf-8 \
-  scripts/mtex_disclination_density_Lie_3.m scripts/prepareSymmetryContinuousField.m \
-  tests/test_symmetry_continuity.m
-```
+没有施加试样对称性；矩阵实现不涉及四元数 q/-q 的符号问题。
+在用户实际 MTEX 版本中还须运行下述对象测试。
 
-以后获准运行 MATLAB 时，可从项目根目录执行：
+## 差分与结果
+
+保留原主值 log 和李代数截断公式；`localRotmLog`、`maskedDerivative`、
+`crossField`、`densityFromOmega` 从脚本原样提取为独立函数，以便测试生产代码。
+两个求导阶段都使用同一受保护边掩膜和有限值检查；中心模板不完整时用
+同侧一阶差分，无同侧邻点保留 NaN。二阶计算不能通过中间 kappa 跳过边界。
+
+保留已有向错密度、晶界叠加、前后对比及质量图；新增：
+
+- `_Symmetry_diagnostics.png`：约化角/旋转增量分布、最终有效像素、
+  屏蔽像素分类、原始相 ID、晶界与相界位置。
+- `_Grain_diagnostics.csv`：各晶粒有效/屏蔽像素数和回路异常边数。
+- MAT 中 `field` 保存约化角前后值、原始/选定增量、操作编号、
+  近简并/未收敛/大物理增量诊断、相网格及边界掩膜。
+
+约化角应保持不变；代表元增量变小本身不能证明向错密度正确。
+绝对主值 log 加截断公式不对任意整体代表元选择保持严格不变，且有 pi 分支问题；
+本次没有替换该定义。定量解释仍需原论文、参考场及真实 EBSD 验证。
+未选相/未索引/无测点的密度均不计算，不作界面分布型密度解释。
+
+## 验证与运行
+
+已执行：11 个 MATLAB 文件的 MISS_HIT 静态检查（包括测试文件），
+以及 `git diff --check`，均通过。**未执行任何 MATLAB 数值测试或真实 EBSD 运行**，
+原因是环境没有 MATLAB、Octave 或许可证；不能把静态检查当作数值通过。
+
+在 MATLAB 中从项目根目录执行：
 
 ```matlab
+addpath('tests');
+run_symmetry_validation; % 无需 MTEX；直接调用生产数值函数
 results = runtests('tests/test_symmetry_continuity.m');
 assertSuccess(results);
+% 先启动用户安装的 MTEX，再执行：
+validate_mtex_symmetry_api;
 ```
 
-这组八项合成回归测试覆盖代表元跳变、真实梯度、晶粒/孪晶量级边界、
-错误晶粒标签、质量空洞、显式保护边界、无效旋转和局部可疑点。
-本次修改未执行 `.m`，未生成真实 EBSD 前后图，也未验证数值结果。
+`run_symmetry_validation` 包含：A 均匀场随机等价表示；B 平缓场及真实 5° 总变化；
+局部真实 5° 跃迁不删边；C 两个具有真实 20° 错配的晶粒及边界同侧密度；
+D 两种不同正旋转群按相分别处理。A/B 的梯度及密度容差为 `1e-10`
+（步长为 1 的合成场），物理约化角容差为 `1e-7 rad`。
+对象验证另用 MTEX 官方 angle 对照约化角并检验矩阵右乘复合。
+所有这些数值/对象测试目前均为**已编写、待运行**。

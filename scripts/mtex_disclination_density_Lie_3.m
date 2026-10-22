@@ -63,12 +63,17 @@ grainBoundaryAngleDeg = 3;
 % 不给 BC/IQ 设置通用阈值，因其强烈依赖仪器、相和采集条件。
 qualityRules = struct('field',{'mad','ci'},'minimum',{[],0.1},'maximum',{1.0,[]});
 % 同晶粒的相邻点若约化取向差过大，也不传播或跨边差分，默认不超过重建阈值。
-maxContinuityAngleDeg = 3;
+maxContinuityAngleDeg = 3; % 仅报告大物理增量，不作为删边阈值
+% 离散图优化参数；容差针对浮点误差，不是物理取向差阈值。
+representativeMaxIterations = 50; % 有限状态下降迭代上限，未收敛会标记
+representativeEnergyTolerance = 1e-12; % rad^2，避免舍入误差引起反复切换
+representativeAmbiguityTolerance = 1e-10; % rad^2，近简并候选需人工核查
+representativeInvarianceTolerance = 1e-7; % rad，acos 在零附近的舍入放大
 % 孤立异常：至少三个同晶粒邻点的约化角中位数超过 2 度时标记为可疑。
-% 默认仅标记；不能仅凭此判据区分错误索引和真实局部取向梯度。
+% 仅供诊断；不能凭此判据区分错误索引和真实局部取向梯度。
 localOutlierAngleDeg = 2;
 minLocalNeighbors = 3;
-excludeLocalOutliers = false;
+excludeLocalOutliers = false; % 必须为 false；代表元模块禁止按角度剔除
 % 如已有独立识别的晶界/孪晶界，可给出保护边掩膜 MAT 文件（不合并孪晶）。
 % 文件包含 blockedX(ny,nx-1)、blockedY(ny-1,nx)、xPlot、yPlot，坐标需与本图一致。
 protectedBoundaryFile = '';
@@ -145,6 +150,12 @@ catch
     error('Could not select indexed EBSD measurements. Check your MTEX version and input data.');
 % 结束 indexed 筛选的异常处理。
 end
+% 明确列出输入相及未处理相；本脚本按目标相分别运行，不混用对称群。
+inputPhaseIds=unique(ebsd.phaseId);
+for pid=inputPhaseIds(:)'
+    cs=ebsd.CSList{pid};
+    fprintf('输入晶相 ID=%d, 名称=%s, 点数=%d\n',pid,cs.mineral,nnz(ebsd.phaseId==pid));
+end
 % 若 phaseName 不为空，则进一步筛选目标物相。
 if ~isempty(phaseName)
     % 尝试按物相名称从已索引测点中选择单一物相。
@@ -159,6 +170,15 @@ if ~isempty(phaseName)
     % 结束物相筛选异常处理。
     end
 % 结束是否选择物相的判断。
+end
+selectedPhaseIds=unique(ebsd.phaseId);
+if numel(selectedPhaseIds)~=1
+    error('请设置 phaseName 选择单一目标相，然后对其他相分别运行，禁止混用对称群。');
+end
+excludedPhaseIds=setdiff(inputPhaseIds,selectedPhaseIds);
+if ~isempty(excludedPhaseIds)
+    warning('本次仅计算 %s；未处理相 ID=%s，请修改 phaseName 后分别运行。', ...
+        phaseName,mat2str(excludedPhaseIds(:)'));
 end
 % 在晶粒重建之前验证坐标，避免用非有限位置建立邻接关系。
 if any(~isfinite(ebsd.x(:))) || any(~isfinite(ebsd.y(:)))
@@ -180,8 +200,8 @@ end
 fprintf('Reconstructing grains (threshold %.2f deg)...\n',grainBoundaryAngleDeg);
 % 尝试根据所选物相的取向重建晶粒。
 try
-    % MTEX 7.2 返回晶粒集合 grains，以及带 grainId 的 EBSD 测点。
-    [grains, ebsd] = calcGrains(ebsd,'angle',grainBoundaryAngleDeg*degree,'minPixel',1);
+    % 本地 MTEX 6.1.1 源码：第二输出是 grainId 数组，写入 EBSD 属性。
+    [grains, ebsd.grainId] = calcGrains(ebsd,'angle',grainBoundaryAngleDeg*degree,'minPixel',1);
 % 捕获晶粒重建失败的异常。
 catch ME
     % 说明可能是晶体对称性或 MTEX 设置问题。
@@ -327,7 +347,26 @@ end
 ori = ebsd.orientations;
 properCS = ori.CS.properGroup;
 symOps = double(matrix(properCS.rot));
-options.maxEdgeAngle = min(maxContinuityAngleDeg,grainBoundaryAngleDeg)*degree;
+% 运行时再用当前加载的 MTEX 对象核实复合侧，避免依赖文档版本猜测。
+for k=1:size(symOps,3)
+    equivalentMatrix=double(matrix(ori(1)*properCS.rot(k)));
+    if norm(equivalentMatrix-Rall(:,:,1)*symOps(:,:,k),'fro')>1e-10
+        error('当前 MTEX 的矩阵复合与 R*S 不一致，停止以免使用错误坐标约定。');
+    end
+end
+runtimeInfo=struct('ebsdClass',class(ebsd),'orientationClass',class(ori), ...
+    'phaseId',selectedPhaseIds,'mineral',ori.CS.mineral, ...
+    'properOperationCount',size(symOps,3),'orientationImplementation',which('orientation'));
+fprintf('EBSD 类型=%s，取向类型=%s，晶相=%s，正旋转群阶数=%d\n', ...
+    runtimeInfo.ebsdClass,runtimeInfo.orientationClass,runtimeInfo.mineral, ...
+    runtimeInfo.properOperationCount);
+
+options.maxEdgeAngle = maxContinuityAngleDeg*degree;
+options.maxIterations=representativeMaxIterations;
+options.energyTolerance=representativeEnergyTolerance;
+options.ambiguityTolerance=representativeAmbiguityTolerance;
+options.invarianceTolerance=representativeInvarianceTolerance;
+options.phaseId=ebsd.phaseId;
 options.localOutlierAngle = localOutlierAngleDeg*degree;
 options.minLocalNeighbors = minLocalNeighbors;
 options.excludeLocalOutliers = excludeLocalOutliers;
@@ -355,6 +394,20 @@ end
 field = prepareSymmetryContinuousField(Rall,grainId,linIdx,[ny,nx], ...
     symOps,qualityGood,seedScore,options);
 grainGrid = field.grainGrid; validGrid = field.validGrid;
+% 把原始扫描中的相信息映射到已经验证的网格，仅作诊断，不插值、不改坐标。
+field.phaseGrid=zeros(ny,nx);
+ax=double(ebsdAll.x(:)); ay=double(ebsdAll.y(:));
+ai=round((ax-x0)/dx)+1; aj=round((ay-y0)/dy)+1;
+onGrid=isfinite(ax) & isfinite(ay) & ai>=1 & ai<=nx & aj>=1 & aj<=ny ...
+    & abs(ax-(x0+(ai-1)*dx))<=max(coordTol*20,dx*1e-3) ...
+    & abs(ay-(y0+(aj-1)*dy))<=max(coordTol*20,dy*1e-3);
+originalPhaseIds=double(ebsdAll.phaseId(:));
+field.phaseGrid(sub2ind([ny,nx],aj(onGrid),ai(onGrid)))=originalPhaseIds(onGrid);
+field.phaseBoundaryX=field.phaseGrid(:,1:end-1)~=field.phaseGrid(:,2:end);
+field.phaseBoundaryY=field.phaseGrid(1:end-1,:)~=field.phaseGrid(2:end,:);
+field.grainBoundaryX=grainGrid(:,1:end-1)~=grainGrid(:,2:end);
+field.grainBoundaryY=grainGrid(1:end-1,:)~=grainGrid(2:end,:);
+
 if nnz(validGrid)<9
     error('Fewer than 9 usable points remain after quality/rotation checks.');
 end
@@ -425,6 +478,8 @@ end
 [outDir,baseName,~] = fileparts(inputFile);
 % 如果只给了相对文件名，则把当前工作目录作为输出目录。
 if isempty(outDir), outDir = pwd; end
+% 分相运行不得覆盖另一相的结果。
+baseName = [baseName '_phase' num2str(selectedPhaseIds)];
 % 设定 CSV 表格的保存路径和文件名。
 csvFile = fullfile(outDir,[baseName '_LieDisclinationDensity.csv']);
 % 设定 MAT 数据文件的保存路径和文件名。
@@ -452,7 +507,9 @@ save(matFile,'theta13','theta23','theta33','rhoTheta','omegaGrid', ...
     'grainBoundaryAngleDeg','inputFile','xVals','yVals','omegaRaw','thetaRaw', ...
     'field','qualityRules','qualityReport','qualityGood','qualityRejectedGrid','suspectGrid', ...
     'edgeX','edgeY','logCutX','logCutY','options','maxLogVectorJumpRad', ...
-    'protectedBoundaryFile','symOps','indexedGrid','invalidRotationGrid');
+    'protectedBoundaryFile','symOps','indexedGrid','invalidRotationGrid', ...
+    'inputPhaseIds','selectedPhaseIds','excludedPhaseIds','runtimeInfo');
+writeContinuityDiagnostics(field,validResult,grainGrid,xPlot,yPlot,outDir,baseName,degree);
 
 %% 保存处理前后分量比较及质量诊断（同分量共用色标）
 compareFile = fullfile(outDir,[baseName '_LieComponents_before_after.png']);
@@ -566,151 +623,6 @@ fprintf(['Check the plots for symmetry-representation jumps and boundary artifac
 
 %% 脚本局部函数
 % 定义局部函数：输入 3×3 旋转矩阵 R，输出主值旋转向量 w。
-function w = localRotmLog(R)
-% 将 SO(3) 旋转矩阵取主值对数，输出单位为弧度的三分量旋转向量。
-    % 用 trace(R)=1+2cos(theta) 求旋转角的余弦。
-    c = (trace(R)-1)/2;
-    % 把余弦限制在 [-1,1] 内，防止浮点误差使 acos 产生复数。
-    c = max(-1,min(1,c));
-    % 反余弦求得主值旋转角，取值为 0 到 pi。
-    th = acos(c);
-    % 取 R 的反对称部分对应的三维轴向向量。
-    v = [R(3,2)-R(2,3); R(1,3)-R(3,1); R(2,1)-R(1,2)];
-    % 对于接近零角度的旋转，使用矩阵对数的一阶近似。
-    if th < 1e-8
-        % 此时旋转向量约等于反对称部分的一半。
-        w = 0.5*v;
-    % 角度没有逼近 pi 时进入常规公式分支。
-    elseif (pi-th) > 1e-5
-        % 用 theta/(2sin theta) 把反对称部分换算为旋转向量。
-        w = (th/(2*sin(th)))*v;
-    % 对于接近 pi 的旋转，使用避免除以极小 sin(theta) 的分支。
-    else
-        % 接近 pi 时 sin(theta) 很小，改用对称部分稳定求旋转轴。
-        % 构造接近轴向外积的对称矩阵。
-        A = (R+eye(3))/2;
-        % 找出最适合恢复轴向的最大对角元位置。
-        [~,k] = max(diag(A));
-        % 初始化三分量旋转轴。
-        axisVec = zeros(3,1);
-        % 用所选对角元的平方根恢复对应轴分量。
-        axisVec(k) = sqrt(max(A(k,k),0));
-        % 若该分量仍非常小，则采用特征分解备用方案。
-        if axisVec(k) < 1e-8
-            % 对 R 的对称部分求特征值和特征向量。
-            [V,D] = eig((R+R')/2);
-            % 找到特征值最接近 1 的旋转轴方向。
-            [~,ii] = min(abs(diag(D)-1));
-            % 把相应实特征向量当作旋转轴。
-            axisVec = real(V(:,ii));
-        % 轴分量足够大时按矩阵非对角元恢复其他分量。
-        else
-            % 循环求出三个轴分量。
-            for j = 1:3
-                % 只计算主轴分量以外的位置。
-                if j ~= k
-                    % 由对称矩阵关系恢复第 j 个轴分量。
-                    axisVec(j) = (R(j,k)+R(k,j))/(4*axisVec(k));
-                % 结束是否为其他分量的判断。
-                end
-            % 结束逐分量循环。
-            end
-        % 结束旋转轴备用恢复方法分支。
-        end
-        % 计算恢复出的轴向量长度。
-        axisNorm = norm(axisVec);
-        % 若长度接近机器精度，则不能稳定归一化。
-        if axisNorm < eps
-            % 使用单位 x 方向作为退化情形的备用轴。
-            axisVec = [1;0;0];
-        % 轴长度足够时进入正常分支。
-        else
-            % 将旋转轴归一化为单位向量。
-            axisVec = axisVec/axisNorm;
-        % 结束轴向量长度判断。
-        end
-        % 反对称部分有足够信息时，用它确定旋转轴的正负方向。
-        % 若反对称部分可辨别符号，且轴与其方向相反，就纠正方向。
-        if norm(v) > 1e-8 && dot(axisVec,v) < 0
-            % 翻转旋转轴的符号。
-            axisVec = -axisVec;
-        % 结束轴方向判断。
-        end
-        % 用主值角乘单位轴得到旋转向量。
-        w = th*axisVec;
-    % 结束接近零角、一般角及接近 pi 的三种情况。
-    end
-% 结束旋转矩阵对数局部函数。
-end
-
-% 定义同晶粒差分函数：输入三分量场 F、晶粒号 G、有效点掩膜、方向 dim 和步长 h。
-function D = maskedDerivative(F,G,valid,dim,h,edgeX,edgeY)
-% 对 ny×nx×3 的 F 求一阶导数，邻点必须属于同一晶粒。
-% dim=2 对列求导（x 方向）；dim=1 对行求导（y 方向）。
-    % 将输出导数初始化为 NaN，表示尚不能计算。
-    D = nan(size(F));
-    % 读入图像的行数 ny 和列数 nx。
-    [ny,nx,~] = size(F);
-    % 遍历每一行像素。
-    for i = 1:ny
-        % 遍历该行的每一列像素。
-        for j = 1:nx
-            % 无效像素或无晶粒号像素直接跳过。
-            if ~valid(i,j) || G(i,j)<=0 || ~all(isfinite(reshape(F(i,j,:),1,[]))), continue; end
-            % 当 dim=2 时，沿列方向即 x 方向计算差分。
-            if dim == 2
-                % 检查左邻点是否存在、有效、属于同一晶粒且三个场分量都有限。
-                hasM = j>1  && edgeX(i,j-1) && valid(i,j-1) && G(i,j-1)==G(i,j) && all(isfinite(reshape(F(i,j-1,:),1,[])));
-                % 以同样条件检查右邻点。
-                hasP = j<nx && edgeX(i,j) && valid(i,j+1) && G(i,j+1)==G(i,j) && all(isfinite(reshape(F(i,j+1,:),1,[])));
-                % 左右同晶粒邻点都可用时采用中心差分。
-                if hasM && hasP
-                    % 用左右邻点之差除以 2h。
-                    D(i,j,:) = (F(i,j+1,:)-F(i,j-1,:))/(2*h);
-                % 只有右邻点可用时改用前向差分。
-                elseif hasP
-                    % 用右邻点与当前点之差除以 h。
-                    D(i,j,:) = (F(i,j+1,:)-F(i,j,:))/h;
-                % 只有左邻点可用时改用后向差分。
-                elseif hasM
-                    % 用当前点与左邻点之差除以 h。
-                    D(i,j,:) = (F(i,j,:)-F(i,j-1,:))/h;
-                % 结束 x 方向邻点选择；无合适邻点则保留 NaN。
-                end
-            % 当 dim=1 时，沿行方向即 y 方向计算差分。
-            elseif dim == 1
-                % 检查上邻点是否存在、有效、同晶粒且场分量有限。
-                hasM = i>1  && edgeY(i-1,j) && valid(i-1,j) && G(i-1,j)==G(i,j) && all(isfinite(reshape(F(i-1,j,:),1,[])));
-                % 以同样条件检查下邻点。
-                hasP = i<ny && edgeY(i,j) && valid(i+1,j) && G(i+1,j)==G(i,j) && all(isfinite(reshape(F(i+1,j,:),1,[])));
-                % 上下同晶粒邻点均可用时采用中心差分。
-                if hasM && hasP
-                    % 用下邻点与上邻点之差除以 2h。
-                    D(i,j,:) = (F(i+1,j,:)-F(i-1,j,:))/(2*h);
-                % 只有下邻点可用时采用前向差分。
-                elseif hasP
-                    % 用下邻点与当前点之差除以 h。
-                    D(i,j,:) = (F(i+1,j,:)-F(i,j,:))/h;
-                % 只有上邻点可用时采用后向差分。
-                elseif hasM
-                    % 用当前点与上邻点之差除以 h。
-                    D(i,j,:) = (F(i,j,:)-F(i-1,j,:))/h;
-                % 结束 y 方向邻点选择；无可用邻点则保留 NaN。
-                end
-            % 当 dim 既不是 1 也不是 2 时进入非法参数分支。
-            else
-                % 说明合法方向参数只有 1 与 2。
-                error('dim must be 1 (y) or 2 (x).');
-            % 结束方向判断。
-            end
-        % 结束列循环。
-        end
-    % 结束行循环。
-    end
-% 结束同晶粒差分函数。
-end
-
-% 定义晶界绘图函数：输入晶粒号网格、坐标向量和两个步长。
 function plotRasterBoundaries(G,xCoords,yCoords,dx,dy)
 % 只绘制两个相邻有效像素所属晶粒编号不同的交界。
 % 晶界线段来自密度图所用的同一个矩形像素网格。
@@ -747,24 +659,6 @@ function plotRasterBoundaries(G,xCoords,yCoords,dx,dy)
 end
 
 % 定义三维向量场叉乘函数，输入和输出都是 ny×nx×3 数组。
-function C = crossField(A,B)
-% 对两个 ny×nx×3 向量场在每个像素处逐点计算三维叉乘。
-    % 预分配结果数组 C，大小与 A 相同。
-    C = nan(size(A));
-    % 拆出 A 在三个轴向的二维分量。
-    ax=A(:,:,1); ay=A(:,:,2); az=A(:,:,3);
-    % 拆出 B 在三个轴向的二维分量。
-    bx=B(:,:,1); by=B(:,:,2); bz=B(:,:,3);
-    % 按向量叉乘公式计算第一分量 ay*bz-az*by。
-    C(:,:,1) = ay.*bz-az.*by;
-    % 按向量叉乘公式计算第二分量 az*bx-ax*bz。
-    C(:,:,2) = az.*bx-ax.*bz;
-    % 按向量叉乘公式计算第三分量 ax*by-ay*bx。
-    C(:,:,3) = ax.*by-ay.*bx;
-% 结束逐像素叉乘函数。
-end
-
-
 function [good,score,report] = checkIndexQuality(prop,n,rules)
 % 按原字段逐项检查：仅记录字段名与阈值，不猜测缺失指标或插补坏点。
     good = true(n,1); score = zeros(n,1);
@@ -810,16 +704,6 @@ function [good,score,report] = checkIndexQuality(prop,n,rules)
     if ~any([report.available])
         warning('No configured quality fields found; quality remains unverified. Inspect indexing diagnostics.');
     end
-end
-
-function [theta,kappaX,kappaY] = densityFromOmega(w,g,valid,edgeX,edgeY,dx,dy)
-% 原有李代数截断公式保持不变；两个差分阶段都遵守同一保护边。
-    dX = maskedDerivative(w,g,valid,2,dx,edgeX,edgeY);
-    dY = maskedDerivative(w,g,valid,1,dy,edgeX,edgeY);
-    kappaX = dX+0.5*crossField(w,dX); kappaY = dY+0.5*crossField(w,dY);
-    curl = maskedDerivative(kappaY,g,valid,2,dx,edgeX,edgeY) ...
-        -maskedDerivative(kappaX,g,valid,1,dy,edgeX,edgeY);
-    theta = curl+0.5*crossField(w,curl);
 end
 
 function compareComponents(before,after,g,x,y,dx,dy,labels,fileName)
