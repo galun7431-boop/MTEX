@@ -202,8 +202,8 @@ end
 fprintf('Reconstructing grains (threshold %.2f deg)...\n',grainBoundaryAngleDeg);
 % 尝试根据所选物相的取向重建晶粒。
 try
-    % 本地 MTEX 6.1.1 源码：第二输出是 grainId 数组，写入 EBSD 属性。
-    [grains, ebsd.grainId] = calcGrains(ebsd,'angle',grainBoundaryAngleDeg*degree,'minPixel',1);
+    % MTEX 7.2 返回带 grainId 属性的 EBSD 对象，采用当前正式接口。
+    [grains, ebsd] = calcGrains(ebsd,'angle',grainBoundaryAngleDeg*degree,'minPixel',1);
 % 捕获晶粒重建失败的异常。
 catch ME
     % 说明可能是晶体对称性或 MTEX 设置问题。
@@ -214,11 +214,11 @@ end
 try
     % 将晶粒编号转成列向量 double，便于随后按测点编号索引。
     grainId = double(ebsd.grainId(:));
-% 如果当前 MTEX 版本不支持直接访问，使用备用属性路径。
+% 若依赖属性读取失败，则从公开 prop 结构读取。
 catch
     % 尝试从 ebsd.prop 中取得晶粒编号。
     try
-        % 读取并转换该版本 MTEX 保存的 grainId。
+        % 读取并转换 MTEX 保存的 grainId。
         grainId = double(ebsd.prop.grainId(:));
     % 捕获两种 grainId 读取方式均失败的异常。
     catch ME

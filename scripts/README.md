@@ -37,17 +37,23 @@ MAD/CI 示例规则，缺失字段会警告，仪器阈值需自行核实。
 
 ## API 与坐标约定
 
-项目说明标注 MTEX 7.2.0，但此云端实际源码
-`/workspace/dependencies/mtex/VERSION` 为 **mtex-6.1.1**。
-没有 MATLAB/Octave，未启动这些 MTEX 类。已检查的真实源码：
+本项目目标版本为 **MTEX 7.2.0**。本次从官方 `mtex-7.2.0` 标签源码核对 API；
+当前执行环境没有 MATLAB/Octave，因此没有加载 MTEX 对象或运行数值测试。
+已检查的 7.2.0 源码：
 
-- `geometry/@orientation/mtimes.m`：取向将晶体向量映射到试样向量。
-- `geometry/@quaternion/symmetrise.m`：晶体操作 `q*CS.rot` 在右，试样操作在左。
-- `geometry/@symmetry/properGroup.m`、`geometry/@rotation/matrix.m`：提取晶体正旋转。
-- `EBSDAnalysis/@EBSD/calcGrains.m`：第二返回值为 grainId 数组，修复原脚本
-  `[grains,ebsd]` 为 `[grains,ebsd.grainId]`。
-- `geometry/@orientation/byMatrix.m` 和 `angle.m`：验证程序使用的官方接口。
+- `EBSDAnalysis/phaseList.m`：`CSList` 是对称对象数组；单相的公开属性为 `CS`。
+  脚本先筛选单相数据，再读取 `phaseEbsd.CS`，不直接使用版本相关的容器索引。
+- `EBSDAnalysis/@EBSD/calcGrains.m`：当前签名为
+  `[grains,ebsd] = calcGrains(ebsd,...)`，第二输出带有 `grainId` 属性。
+- `geometry/@orientation/mtimes.m` 与 `geometry/@quaternion/symmetrise.m`：
+  晶体对称操作在右侧复合，即 `R*S`；试样对称操作在左侧。
+- `geometry/@symmetry/properGroup.m`、`geometry/@rotation/matrix.m`：用于取得
+  晶体正旋转及其矩阵表示。
+- `geometry/@orientation/byMatrix.m` 和 `angle.m`：API 验证程序使用的接口。
 
+脚本采用 MTEX 7.2.0 的 `calcGrains` 输出语法，并在运行时检查 `R*S` 与
+MTEX 对象复合结果一致。没有施加试样对称性；矩阵实现不涉及四元数 q/-q 的符号问题。
+数值和真实 EBSD 结果仍需在 MATLAB/MTEX 7.2.0 中实际运行验证。
 没有施加试样对称性；矩阵实现不涉及四元数 q/-q 的符号问题。
 在用户实际 MTEX 版本中还须运行下述对象测试。
 
